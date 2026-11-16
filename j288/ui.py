@@ -1,5 +1,6 @@
 """Textual screen for the bench. The motor state lives in j288.bench."""
 
+import threading
 import time
 
 from rich.console import Group
@@ -20,6 +21,7 @@ from j288.bench import (
     WAVE_MIN,
     short_port,
 )
+from j288.log import note
 from j288.protocol import error_names, warn_names
 
 _EMPTY = "#2a3542"
@@ -173,7 +175,8 @@ def _key_bar():
     piece("m", "FOC")
     piece("0", "stop")
     piece("q", "quit", newline=True)
-    piece(":", "exact value")
+    piece(":", "connect, spd, pos, clear, reset")
+    piece("< >", "pick port")
     return text
 
 
@@ -305,7 +308,7 @@ class Dashboard(App):
         display: none;
     }
     #notice.open { display: block; }
-    #row { height: 14; }
+    #row { height: 12; }
     .panel {
         height: 1fr;
         background: #161c24;
@@ -323,45 +326,61 @@ class Dashboard(App):
     .panel.travel { border: round #e2b15a; }
     .panel.matched { border: round #46c98a; }
     #controls {
-        height: 9;
+        height: 15;
         background: #101418;
     }
-    #gains, #motion, #wave-row {
+    #gains, #motion, #wave-row, #step-row, #port-row {
         height: 3;
-        overflow-x: auto;
-        overflow-y: hidden;
+        overflow: hidden hidden;
+    }
+    .col {
+        width: 40;
+        height: 3;
     }
     .ctl-tag {
-        width: 5;
+        width: 4;
         height: 3;
         content-align: right middle;
         color: #8ea0b0;
     }
+    .ctl-val {
+        width: 8;
+        height: 3;
+        content-align: left middle;
+        color: #e7eef4;
+        text-style: bold;
+    }
     #controls Button {
-        min-width: 6;
         height: 3;
         margin: 0 0 0 1;
-        padding: 0 1;
+        padding: 0;
         background: #1c2836;
         color: #e7eef4;
         border: none;
+    }
+    #controls Button.nudge {
+        width: 6;
+        min-width: 6;
+    }
+    #controls Button.act {
+        width: 9;
+        min-width: 9;
     }
     #controls Button:hover, #controls Button:focus {
         background: #2c4a66;
         color: #e7eef4;
     }
-    #wave-hz {
-        width: 8;
+    #trace-src {
+        width: 11;
+        min-width: 11;
+        margin-left: 0;
     }
-    #wave-lo, #wave-hi, #step-dt {
-        width: 7;
-    }
-    #step-n {
-        width: 4;
-    }
-    #step-spd, #ki-val {
-        width: 6;
-    }
+    #wave-grp, #step-grp, #vmax-grp { height: 3; }
+    #wave-grp { width: 43; margin-right: 2; }
+    #step-grp { width: 50; margin-right: 2; }
+    #vmax-grp { width: 26; }
+    #step-n { width: 4; }
+    #port-name { width: 24; }
     #foc {
         background: #1a3d2e;
         color: #b7f0d4;
@@ -371,8 +390,9 @@ class Dashboard(App):
         color: #f0d7b0;
     }
     #live { height: 4; }
-    #trace { height: 2fr; min-height: 4; }
+    #trace { height: 2fr; min-height: 3; }
     #keys {
+        dock: bottom;
         height: 2;
         padding: 0 1;
         background: #101418;
@@ -380,7 +400,7 @@ class Dashboard(App):
     #logrow {
         height: 1fr;
         max-height: 12;
-        min-height: 8;
+        min-height: 4;
     }
     #log, #serial {
         height: 1fr;
@@ -410,9 +430,9 @@ class Dashboard(App):
         self._history = []
         self._hist_at = 0.0
         self._log_cache = []
-        self._work_queued = False
         self._epoch = model.epoch
         self._trace_src = ""
+        self._io = None
 
     def compose(self):
         yield Static("", id="status")
@@ -423,67 +443,86 @@ class Dashboard(App):
             yield RatePanel()
         with Vertical(id="controls"):
             with Horizontal(id="gains"):
-                yield Static("Kp", classes="ctl-tag")
-                yield Button("-1", id="kp-down")
-                yield Button("+1", id="kp-up")
-                yield Button("-.1", id="kp-down01")
-                yield Button("+.1", id="kp-up01")
-                yield Static("Kd", classes="ctl-tag")
-                yield Button("-.1", id="kd-down")
-                yield Button("+.1", id="kd-up")
-                yield Button("-1", id="kd-down1")
-                yield Button("+1", id="kd-up1")
-                yield Static("PI", classes="ctl-tag")
-                yield Button("-.01", id="ki-down01")
-                yield Button("+.01", id="ki-up01")
-                yield Button("-.1", id="ki-down")
-                yield Button("+.1", id="ki-up")
-                yield Static("0.00", id="ki-val", classes="ctl-tag")
+                with Horizontal(classes="col"):
+                    yield Static("Kp", classes="ctl-tag")
+                    yield Button("-1", id="kp-down", classes="nudge")
+                    yield Button("+1", id="kp-up", classes="nudge")
+                    yield Button("-.1", id="kp-down01", classes="nudge")
+                    yield Button("+.1", id="kp-up01", classes="nudge")
+                    yield Static("", classes="ctl-val")
+                with Horizontal(classes="col"):
+                    yield Static("Kd", classes="ctl-tag")
+                    yield Button("-1", id="kd-down1", classes="nudge")
+                    yield Button("+1", id="kd-up1", classes="nudge")
+                    yield Button("-.1", id="kd-down", classes="nudge")
+                    yield Button("+.1", id="kd-up", classes="nudge")
+                    yield Static("", classes="ctl-val")
+                with Horizontal(classes="col"):
+                    yield Static("PI", classes="ctl-tag")
+                    yield Button("-.1", id="ki-down", classes="nudge")
+                    yield Button("+.1", id="ki-up", classes="nudge")
+                    yield Button("-.01", id="ki-down01", classes="nudge")
+                    yield Button("+.01", id="ki-up01", classes="nudge")
+                    yield Static("0.00", id="ki-val", classes="ctl-val")
             with Horizontal(id="motion"):
-                yield Static("Tex", classes="ctl-tag")
-                yield Button("-.1", id="tor-down")
-                yield Button("+.1", id="tor-up")
-                yield Static("Spd", classes="ctl-tag")
-                yield Button("-.1", id="spd-down")
-                yield Button("+.1", id="spd-up")
-                yield Static("Pos", classes="ctl-tag")
-                yield Button("-.1", id="pos-down")
-                yield Button("+.1", id="pos-up")
-                yield Static("Id", classes="ctl-tag")
-                yield Button("-", id="id-down")
-                yield Button("+", id="id-up")
-                yield Button("Tmo on", id="tmo")
-                yield Button("Lock", id="lock")
-                yield Button("FOC", id="foc")
+                with Horizontal(classes="col"):
+                    yield Static("Tex", classes="ctl-tag")
+                    yield Button("-.1", id="tor-down", classes="nudge")
+                    yield Button("+.1", id="tor-up", classes="nudge")
+                with Horizontal(classes="col"):
+                    yield Static("Spd", classes="ctl-tag")
+                    yield Button("-.1", id="spd-down", classes="nudge")
+                    yield Button("+.1", id="spd-up", classes="nudge")
+                with Horizontal(classes="col"):
+                    yield Static("Pos", classes="ctl-tag")
+                    yield Button("-.1", id="pos-down", classes="nudge")
+                    yield Button("+.1", id="pos-up", classes="nudge")
+                    yield Static("Id", classes="ctl-tag")
+                    yield Button("-", id="id-down", classes="nudge")
+                    yield Button("+", id="id-up", classes="nudge")
+                yield Button("Tmo on", id="tmo", classes="act")
+                yield Button("Lock", id="lock", classes="act")
+                yield Button("FOC", id="foc", classes="act")
             with Horizontal(id="wave-row"):
-                yield Static("Lo", classes="ctl-tag")
-                yield Button("-1", id="lo-down1")
-                yield Button("-.1", id="lo-down")
-                yield Button("+.1", id="lo-up")
-                yield Button("+1", id="lo-up1")
-                yield Static("%.2f" % WAVE_MIN, id="wave-lo", classes="ctl-tag")
-                yield Static("Hi", classes="ctl-tag")
-                yield Button("-1", id="hi-down1")
-                yield Button("-.1", id="hi-down")
-                yield Button("+.1", id="hi-up")
-                yield Button("+1", id="hi-up1")
-                yield Static("%.2f" % WAVE_MAX, id="wave-hi", classes="ctl-tag")
-                yield Button("Trace tor", id="trace-src")
-                yield Button("Wave", id="wave")
-                yield Button("-.01", id="hz-down")
-                yield Button("+.01", id="hz-up")
-                yield Static("%.2fHz" % WAVE_HZ, id="wave-hz", classes="ctl-tag")
-                yield Button("Step", id="step")
-                yield Button("-.1", id="dt-down")
-                yield Button("+.1", id="dt-up")
-                yield Static("%.2fs" % STEP_DT, id="step-dt", classes="ctl-tag")
-                yield Button("-", id="n-down")
-                yield Button("+", id="n-up")
-                yield Static("%d" % STEP_N, id="step-n", classes="ctl-tag")
-                yield Static("Vmax", classes="ctl-tag")
-                yield Button("-.1", id="vmax-down")
-                yield Button("+.1", id="vmax-up")
-                yield Static("%.2f" % STEP_SPD, id="step-spd", classes="ctl-tag")
+                with Horizontal(classes="col"):
+                    yield Static("Lo", classes="ctl-tag")
+                    yield Button("-1", id="lo-down1", classes="nudge")
+                    yield Button("+1", id="lo-up1", classes="nudge")
+                    yield Button("-.1", id="lo-down", classes="nudge")
+                    yield Button("+.1", id="lo-up", classes="nudge")
+                    yield Static("%.2f" % WAVE_MIN, id="wave-lo", classes="ctl-val")
+                with Horizontal(classes="col"):
+                    yield Static("Hi", classes="ctl-tag")
+                    yield Button("-1", id="hi-down1", classes="nudge")
+                    yield Button("+1", id="hi-up1", classes="nudge")
+                    yield Button("-.1", id="hi-down", classes="nudge")
+                    yield Button("+.1", id="hi-up", classes="nudge")
+                    yield Static("%.2f" % WAVE_MAX, id="wave-hi", classes="ctl-val")
+            with Horizontal(id="step-row"):
+                with Horizontal(id="wave-grp"):
+                    yield Button("Trace tor", id="trace-src")
+                    yield Button("Wave", id="wave", classes="act")
+                    yield Button("-.01", id="hz-down", classes="nudge")
+                    yield Button("+.01", id="hz-up", classes="nudge")
+                    yield Static("%.2fHz" % WAVE_HZ, id="wave-hz", classes="ctl-val")
+                with Horizontal(id="step-grp"):
+                    yield Button("Step", id="step", classes="act")
+                    yield Button("-.1", id="dt-down", classes="nudge")
+                    yield Button("+.1", id="dt-up", classes="nudge")
+                    yield Static("%.2fs" % STEP_DT, id="step-dt", classes="ctl-val")
+                    yield Button("-", id="n-down", classes="nudge")
+                    yield Button("+", id="n-up", classes="nudge")
+                    yield Static("%d" % STEP_N, id="step-n", classes="ctl-val")
+                with Horizontal(id="vmax-grp"):
+                    yield Static("Vmax", classes="ctl-tag")
+                    yield Button("-.1", id="vmax-down", classes="nudge")
+                    yield Button("+.1", id="vmax-up", classes="nudge")
+                    yield Static("%.2f" % STEP_SPD, id="step-spd", classes="ctl-val")
+            with Horizontal(id="port-row"):
+                yield Static("Port", classes="ctl-tag")
+                yield Button("<", id="port-prev", classes="nudge")
+                yield Static("—", id="port-name", classes="ctl-val")
+                yield Button(">", id="port-next", classes="nudge")
         yield LivePanel()
         yield TracePanel()
         yield Static(_key_bar(), id="keys")
@@ -510,10 +549,29 @@ class Dashboard(App):
         self.query_one("#log", RichLog).can_focus = False
         self.query_one("#cmd", Input).can_focus = False
         self._paint()
+        self._io = threading.Thread(target=self._io_loop, name="j288-io", daemon=True)
+        self._io.start()
         self.set_interval(_FRAME_S, self._on_frame)
 
     def on_unmount(self):
         self.model.shutdown()
+        thread = self._io
+        if thread is not None:
+            thread.join(timeout=1.0)
+
+    def _io_loop(self):
+        """Poll and connect off the screen thread so a slow port cannot freeze it."""
+        while not self.model._closed:
+            started = time.monotonic()
+            try:
+                self.model.tick()
+            except Exception as exc:
+                note("tick %s" % exc)
+            if self.model._closed:
+                return
+            delay = 0.01 - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
 
     def on_key(self, event):
         cmd = self.query_one("#cmd", Input)
@@ -542,17 +600,21 @@ class Dashboard(App):
         if action is None:
             return
         field, delta = action
-        self.model.nudge(field, delta)
+        if field == "port":
+            self.model.post(lambda: self.model.choose_port(delta))
+        else:
+            self.model.nudge(field, delta)
         event.stop()
         self._paint()
 
     def on_input_submitted(self, event):
         text = event.value
         self._close_command()
-        self.model.apply_command(text)
+        self.model.post(lambda: self.model.apply_command(text))
         self._paint()
 
     def _open_command(self):
+        self.query_one("#keys").display = False
         cmd = self.query_one("#cmd", Input)
         cmd.value = ""
         cmd.can_focus = True
@@ -565,6 +627,7 @@ class Dashboard(App):
         cmd.remove_class("open")
         if cmd.has_focus:
             self.set_focus(None)
+        self.query_one("#keys").display = True
 
     def _alive(self):
         return self.is_running and self.is_mounted
@@ -573,19 +636,6 @@ class Dashboard(App):
         if not self._alive():
             return
         self.model.slew_tick()
-        self._sample()
-        self._paint()
-        if self._work_queued:
-            return
-        self._work_queued = True
-        if not self.call_after_refresh(self._after_paint):
-            self._work_queued = False
-
-    def _after_paint(self):
-        self._work_queued = False
-        if not self._alive():
-            return
-        self.model.tick()
         self._sample()
         self._paint()
 
@@ -673,6 +723,12 @@ class Dashboard(App):
             if getattr(node, "_shown", None) != text:
                 node.update(text)
                 node._shown = text
+        shown = model.port if model.linked else (model.port_pref or model.port)
+        port_label = short_port(shown, 36) if shown else "—"
+        port_node = self.query_one("#port-name", Static)
+        if getattr(port_node, "_shown", None) != port_label:
+            port_node.update(port_label)
+            port_node._shown = port_label
         foc = self.query_one("#foc", Button)
         lock = self.query_one("#lock", Button)
         foc.variant = "success" if model.armed else "default"
@@ -914,6 +970,8 @@ _BUTTONS = {
     "hi-up": ("wave_hi", 0.1),
     "hi-down1": ("wave_hi", -1.0),
     "hi-up1": ("wave_hi", 1.0),
+    "port-prev": ("port", -1),
+    "port-next": ("port", 1),
 }
 
 

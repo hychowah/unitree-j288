@@ -2,8 +2,10 @@
 # Launch the J288 / S288 bench dashboard.
 # Usage:
 #   ./launch-ui.sh
-#   ./launch-ui.sh /dev/cu.usbmodem...
+#   ./launch-ui.sh /dev/cu.usbmodem...   macOS
+#   ./launch-ui.sh /dev/ttyACM0          Linux
 #   ./launch-ui.sh --sim
+#   Windows: py -3 -m j288 COM5
 
 set -euo pipefail
 

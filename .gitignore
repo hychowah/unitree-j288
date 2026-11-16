@@ -4,5 +4,7 @@ __pycache__/
 .pytest_cache/
 .playwright-mcp/
 motor_settings.json
+.log/
+j288.log
 *.json.tmp
 .DS_Store

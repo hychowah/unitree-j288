@@ -1,13 +1,15 @@
-"""Servo commands, feedback, and the serial poll. No widgets."""
+"""Dashboard behavior for one servo. The wire lives on Motor. No widgets."""
 
 import json
 import math
-import select
+import threading
 import time
 from pathlib import Path
 
+from j288.bus import PROBE_WAIT, SerialBus, list_serial_ports
+from j288.log import note
+from j288.motor import RESET_QUIET, Motor
 from j288.protocol import (
-    BAUD,
     CLEARABLE_BITS,
     ERROR_BITS,
     KD_LIM,
@@ -16,11 +18,9 @@ from j288.protocol import (
     SPD_LIM,
     TOR_LIM,
     TOR_MIN,
-    build_packet,
     clamp,
     clamp_pos,
     error_names,
-    parse_feedback,
     warn_names,
 )
 
@@ -48,58 +48,23 @@ def default_settings_path():
     return Path(__file__).resolve().parent.parent / "motor_settings.json"
 
 
-def candidate_ports(preferred=""):
-    """Serial devices that might be the servo.
-
-    The AT32 adapter enumerates two USB serial ports. On macOS only the
-    /dev/cu.* node is opened. The /dev/tty.* twin can block.
-    """
-    try:
-        from serial.tools import list_ports
-    except ImportError:
-        return [preferred] if preferred else []
-    found = []
-    for info in list_ports.comports():
-        device = info.device
-        low = device.lower()
-        if any(word in low for word in ("bluetooth", "debug-console", "wlan-debug")):
-            continue
-        if device.startswith("/dev/cu."):
-            found.append(device)
-        elif device.startswith("/dev/ttyUSB") or device.startswith("/dev/ttyACM"):
-            found.append(device)
-        elif low.startswith("com"):
-            found.append(device)
-    found.sort()
-    if preferred and preferred not in found:
-        found.insert(0, preferred)
-    elif preferred:
-        found.remove(preferred)
-        found.insert(0, preferred)
-    return found
-
-
-def short_port(port):
-    name = str(port).rsplit("/", 1)[-1]
+def short_port(port, limit=22):
+    name = str(port).replace("\\", "/").rsplit("/", 1)[-1]
     if name.startswith("cu."):
         name = name[3:]
-    if len(name) > 22:
+    limit = max(8, int(limit))
+    if len(name) > limit:
         name = name[:8] + "…" + name[-8:]
     return name or "—"
 
 
-class MotorBench:
-    """Servo command, feedback, and key handling. No Textual and no Rich."""
+class MotorBench(Motor):
+    """One servo plus the screen: slew, wave, step, Ki, settings, and the port."""
 
     def __init__(self, port="", sim=False, settings_path=None):
+        super().__init__(0, SerialBus(), rate_hz=40.0)
         self.port_pref = ""
         self.port = ""
-        self.baud = BAUD
-        self.motor_id = 0
-        self.timeout_flag = 1
-        self.armed = False
-        self.cmd_tor = 0.0
-        self.cmd_spd = 0.0
         self.cmd_pos = (WAVE_MIN + WAVE_MAX) / 2.0
         self.kp = WAVE_KP
         self.kd = WAVE_KD
@@ -122,32 +87,11 @@ class MotorBench:
         self.trace_src = "tor"
         self._wave_phase = 0.0
         self._wave_at = 0.0
-        self.meas_tor = 0.0
-        self.meas_spd = 0.0
-        self.meas_pos = 0.0
-        self.ex_pos = 0.0
-        self.temp = None
-        self.sensor = None
-        self.vol = None
-        self.merror = 0
-        self.mwarn = 0
-        self.fb_mode = 0
-        self.fb_timeout = 0
-        self.fb_id = 0
-        self.correct = 0
-        self.rxlen = 0
-        self.miss = 0
-        self.rx_ok = 0
-        self.tx_count = 0
-        self.raw_tx = b""
-        self.raw_rx = b""
-        self.rtt_ms = 0.0
         self.linked = False
         self.sim = bool(sim)
         self.notice = ""
         self.log_lines = []
         self.epoch = 0
-        self.rate_hz = 40.0
         self.slew_rate = 0.0
         self._spd_cap = ARROW_SPD
         self._pos_touched = False
@@ -156,8 +100,6 @@ class MotorBench:
         self._slew_at = 0.0
         self._slew_key_at = 0.0
         self._slew_max = 0.0
-        self._ser = None
-        self._next_io = 0.0
         self._settings_path = None
         if not sim:
             self._settings_path = (
@@ -169,17 +111,34 @@ class MotorBench:
         if port:
             self.port_pref = str(port)
             self.port = self.port_pref
-        self._quiet_until = 0.0
-        self._once = ""
         self._tried = bool(sim)
+        self._port_only = False
         self._closed = False
         self._fault_key = None
         self._said_bcast = False
+        self._busy = threading.Lock()
+        self._shut = False
+        self._job_lock = threading.Lock()
+        self._jobs = []
         self.append("locked. m enables FOC. 0 stops. arrows slew speed and position")
 
+    def post(self, fn):
+        """Run fn on the next tick(). The screen uses this for port work."""
+        with self._job_lock:
+            self._jobs.append(fn)
+
+    def _take_jobs(self):
+        with self._job_lock:
+            jobs = self._jobs
+            self._jobs = []
+        return jobs
+
+    def wire_torque(self):
+        """Torque word on the bus. The Ki integral in torque_command is not used."""
+        return self.cmd_tor
+
     def append(self, text):
-        self.log_lines.append(str(text))
-        del self.log_lines[:-40]
+        self.log_lines = (self.log_lines + [str(text)])[-40:]
 
     @property
     def position_loop(self):
@@ -205,13 +164,6 @@ class MotorBench:
         if self._once == "reset":
             return "reset"
         return "FOC" if self.armed else "lock"
-
-    def command_mode(self):
-        if self._once == "clear":
-            return 6
-        if self._once == "reset":
-            return 7
-        return 1 if self.armed else 0
 
     def slewing(self, now=None):
         if self._slew_dir == 0:
@@ -267,6 +219,9 @@ class MotorBench:
         self.armed = not self.armed
         self._once = ""
         if self.armed:
+            if self.fresh():
+                self.cmd_pos = clamp_pos(self.meas_pos)
+                self._pos_touched = True
             if self.position_loop and abs(self.cmd_pos - self.meas_pos) > 0.5:
                 self.notice = "FOC %.2f rad from the shaft" % (self.cmd_pos - self.meas_pos)
             elif not self.position_loop and abs(self.cmd_spd) > 0.05:
@@ -283,7 +238,7 @@ class MotorBench:
             self._reset_integrator()
             self.notice = ""
             self.append("locked")
-        self._next_io = 0.0
+        self.next_poll = 0.0
 
     def stop(self):
         self.wave_on = False
@@ -301,7 +256,7 @@ class MotorBench:
         self.slew_rate = 0.0
         self.notice = ""
         self.append("stop")
-        self._next_io = 0.0
+        self.next_poll = 0.0
 
     def apply_command(self, text):
         parts = str(text).strip().split()
@@ -330,19 +285,15 @@ class MotorBench:
             self.notice = ""
             return
         if cmd == "clear":
-            self.armed = False
-            self._once = "clear"
-            self._next_io = 0.0
+            self.clear()
+            self.next_poll = 0.0
             self.notice = "clear sent, motor stays locked"
             self.append(self.notice)
             return
         if cmd == "reset":
-            self.armed = False
-            self.cmd_spd = 0.0
-            self.cmd_tor = 0.0
-            self._once = "reset"
-            self._next_io = 0.0
-            self.notice = "reset sent, ignoring the bus for 0.4 s"
+            self.reset()
+            self.next_poll = 0.0
+            self.notice = "reset sent, ignoring the bus for %.1f s" % RESET_QUIET
             self.append(self.notice)
             return
         if cmd == "port":
@@ -351,6 +302,7 @@ class MotorBench:
                 self.append(self.notice)
                 return
             self.port_pref = parts[1]
+            self._port_only = True
             self._tried = False
             self.connect()
             return
@@ -512,6 +464,9 @@ class MotorBench:
             self.trace_src = "pos" if self.trace_src == "tor" else "tor"
             self.append("trace %s" % self.trace_src)
             return
+        if field == "port":
+            self.choose_port(delta)
+            return
         if (self.wave_on or self.step_on) and field in ("pos", "spd"):
             self.notice = "loop is running"
             return
@@ -563,9 +518,9 @@ class MotorBench:
         self._pos_touched = True
         self.step_on = False
         self.wave_on = True
-        self.advance_wave(self._wave_at)
         if not self.armed:
             self.toggle_armed()
+        self.advance_wave(self._wave_at)
         self.notice = "wave %.2f Hz   %.2f–%.2f rad" % (self.wave_hz, self.wave_lo, self.wave_hi)
         self.append(
             "wave on  Kp %.1f  Kd %.2f  %.2f Hz  %.2f–%.2f"
@@ -612,9 +567,9 @@ class MotorBench:
         self._pos_touched = True
         self.wave_on = False
         self.step_on = True
-        self._apply_step()
         if not self.armed:
             self.toggle_armed()
+        self._apply_step()
         self.notice = "step %d × %.2fs   %.3f rad/s" % (n, self.step_dt, self.step_spd)
         self.append(self.notice)
 
@@ -698,27 +653,66 @@ class MotorBench:
         elif key == "0":
             self.stop()
 
+    def choose_port(self, step):
+        """Connect to the next or previous adapter. Only that device is tried."""
+        shown = self.port_pref or self.port
+        ports = list_serial_ports(shown)
+        if not ports:
+            self.notice = "no serial port"
+            self.append(self.notice)
+            return
+        current = shown
+        idx = ports.index(current) if current in ports else -1
+        if step:
+            idx = (idx + int(step)) % len(ports)
+        elif idx < 0:
+            idx = 0
+        self.port_pref = ports[idx]
+        self._port_only = True
+        self._tried = False
+        self.connect()
+
     def connect(self):
+        only = self._port_only
+        self._port_only = False
         if self._closed:
             return False
         self._close_ser()
         self.linked = False
         self.correct = 0
-        ports = candidate_ports(self.port_pref)
+        self.quiet_until = 0.0
+        if only and self.port_pref:
+            ports = [self.port_pref]
+        else:
+            ports = list_serial_ports(self.port_pref)
         if not ports:
             self.notice = "no serial port"
             self.append(self.notice)
             self._tried = True
+            note("connect no port")
             return False
+        self.notice = "searching"
+        note("connect %s" % ", ".join(ports))
         errors = []
         for port in ports:
+            if self._closed:
+                return False
+            note("open %s" % port)
             try:
                 self._open(port)
             except Exception as exc:
+                note("open %s failed %s" % (port, exc))
                 errors.append("%s: %s" % (short_port(port), exc))
                 self._close_ser()
                 continue
-            if self._exchange(probe=True):
+            try:
+                found = self._find_motor()
+            except Exception as exc:
+                note("open %s failed %s" % (port, exc))
+                errors.append("%s: %s" % (short_port(port), exc))
+                self._close_ser()
+                continue
+            if found:
                 self.port = port
                 self.linked = True
                 self.sim = False
@@ -726,6 +720,7 @@ class MotorBench:
                 self._tried = True
                 self.notice = ""
                 self.append("link %s" % port)
+                note("link %s id %d" % (port, self.motor_id))
                 self._announce_feedback()
                 self._clear_tripped_timeout()
                 return True
@@ -734,10 +729,26 @@ class MotorBench:
         self._tried = True
         self.notice = "no motor reply"
         self.append(self.notice + " — " + "; ".join(errors))
+        note("no reply %s" % "; ".join(errors))
         return False
 
     def tick(self):
-        """One bus exchange, after the screen has painted."""
+        """One poll. Posted work runs first, on this same call."""
+        with self._busy:
+            if self._closed:
+                return
+            for fn in self._take_jobs():
+                try:
+                    fn()
+                except Exception as exc:
+                    note("job %s" % exc)
+                    self.notice = str(exc)
+                    self.append(self.notice)
+            if self._closed:
+                return
+            self._tick_body()
+
+    def _tick_body(self):
         if self._closed:
             return
         now = time.monotonic()
@@ -746,44 +757,51 @@ class MotorBench:
             return
         if not self._tried:
             self._tried = True
-            self.connect()
+            try:
+                self.connect()
+            except Exception as exc:
+                note("connect %s" % exc)
+                self._close_ser()
+                self.linked = False
+                self.notice = "connect failed: %s" % exc
+                self.append(self.notice)
             return
-        if now < self._quiet_until or now < self._next_io:
+        if not self.bus.is_open or not self.linked:
             return
-        if self._ser is None or not self.linked:
-            return
-        period = 1.0 / self.rate_hz if self.rate_hz else 0.025
-        if self.miss >= 5:
-            period = max(period, 0.2)
-        self._next_io = now + period
+        was = self.miss
+        sent = self.tx_count
         try:
-            self._exchange(probe=False)
+            ok = self.poll()
         except Exception as exc:
+            note("poll %s" % exc)
             self._close_ser()
             self.linked = False
             self.correct = 0
             self.notice = "serial closed: %s" % exc
             self.append(self.notice)
+            return
+        if self.tx_count != sent:
+            self._after_send(was, ok)
 
     def _tick_sim(self, now):
-        if now < self._next_io:
+        if now < self.next_poll:
             return
-        dt = 0.025 if self._next_io == 0.0 else min(0.1, max(0.0, now - self._next_io + 0.025))
-        self._next_io = now + 0.025
+        dt = 0.025 if self.next_poll == 0.0 else min(0.1, max(0.0, now - self.next_poll + 0.025))
+        self.next_poll = now + 0.025
         if self.command_mode() == 6:
             self.merror = 0
             self._once = ""
         elif self.command_mode() == 7:
             self._once = ""
-            self._quiet_until = now + 0.4
+            self.quiet_until = now + RESET_QUIET
         if self.armed and self.position_loop:
             err = self.cmd_pos - self.meas_pos
             spd_err = self.cmd_spd - self.meas_spd
-            acc = clamp(self.kp * err + max(self.kd, 0.2) * spd_err + self.torque_command(now), -40.0, 40.0)
+            acc = clamp(self.kp * err + max(self.kd, 0.2) * spd_err + self.cmd_tor, -40.0, 40.0)
             self.meas_spd = clamp(self.meas_spd + acc * dt, -20.0, 20.0)
         elif self.armed:
             kd = self.kd if self.kd > 0.0 else 4.0
-            acc = clamp(kd * (self.cmd_spd - self.meas_spd) + self.torque_command(now), -20.0, 20.0)
+            acc = clamp(kd * (self.cmd_spd - self.meas_spd) + self.cmd_tor, -20.0, 20.0)
             self.meas_spd = clamp(self.meas_spd + acc * dt, -20.0, 20.0)
         else:
             self.meas_spd *= max(0.0, 1.0 - 12.0 * dt)
@@ -808,125 +826,64 @@ class MotorBench:
         self.linked = False
 
     def _open(self, port):
-        import serial
-
-        kwargs = dict(
-            baudrate=self.baud,
-            timeout=0,
-            write_timeout=0.05,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-        )
-        try:
-            self._ser = serial.Serial(port, exclusive=True, **kwargs)
-        except TypeError:
-            self._ser = serial.Serial(port, **kwargs)
+        self.bus.open(port)
 
     def _close_ser(self):
-        ser = self._ser
-        self._ser = None
-        if ser is None:
-            return
-        try:
-            if ser.is_open:
-                ser.close()
-        except Exception:
-            pass
+        self.bus.close()
 
-    def _exchange(self, probe):
-        once = self._once
-        mode = self.command_mode()
-        raw = once in ("clear", "reset")
-        if once == "clear":
-            # Documented clear frame: status 6, tor_des -256, every other count 0.
-            tor, spd, pos, kp, kd = -256, 0, 0, 0, 0
-        elif once == "reset":
-            tor, spd, pos, kp, kd = 0, 0, 0, 0, 0
-        else:
-            tor, spd, pos = self.torque_command(time.monotonic()), self.cmd_spd, self.cmd_pos
-            kp, kd = self.kp, self.kd
-        packet = build_packet(
-            self.motor_id, mode, self.timeout_flag, tor, spd, pos, kp, kd, raw=raw
-        )
-        self.raw_tx = bytes(packet)
-        ser = self._ser
-        ser.reset_input_buffer()
-        started = time.monotonic()
-        wrote = ser.write(packet)
-        if wrote != len(packet):
-            raise RuntimeError("short write %s/%s" % (wrote, len(packet)))
-        ser.flush()
-        self.tx_count += 1
-        if once == "reset":
-            self._once = ""
-            self._quiet_until = time.monotonic() + 0.4
-        elif once == "clear":
-            self._once = ""
-        if self.motor_id == 15:
-            self.raw_rx = b""
-            self.rxlen = 0
+    def _find_motor(self):
+        """Keep this id when it answers. Otherwise use the first of 0–14 that does."""
+        saved = int(self.motor_id)
+        first = saved if 0 <= saved <= 14 else 0
+        for motor_id in (first, *[i for i in range(15) if i != first]):
+            if self._closed:
+                self.motor_id = saved
+                return False
+            self.motor_id = motor_id
+            self.miss = 0
+            sent = self.tx_count
+            note("probe id %d" % motor_id)
+            started = time.monotonic()
+            try:
+                ok = self.send(wait_s=PROBE_WAIT)
+            except Exception as exc:
+                note("probe id %d error %s" % (motor_id, exc))
+                raise
+            note(
+                "probe id %d %s %.0fms rx %d"
+                % (
+                    motor_id,
+                    "ok" if ok else "miss",
+                    (time.monotonic() - started) * 1000.0,
+                    self.rxlen,
+                )
+            )
+            if self.tx_count != sent and ok and self._after_send(0, True):
+                if motor_id != saved:
+                    self.append("id %d" % motor_id)
+                return True
+        self.motor_id = saved
+        return False
+
+    def _after_send(self, was_miss, ok):
+        """Screen reaction to a send() that actually wrote a frame."""
+        wire_id = max(0, min(15, int(self.motor_id)))
+        if wire_id == 15:
             if not self._said_bcast:
                 self._said_bcast = True
                 self.notice = "id 15 broadcasts and does not reply"
                 self.append(self.notice)
             return False
-        frame, rxlen = self._read_frame(0.05 if probe else 0.02)
-        self.raw_rx = bytes(frame) if frame else b""
-        self.rxlen = rxlen
-        self.rtt_ms = (time.monotonic() - started) * 1000.0
-        parsed = parse_feedback(frame) if isinstance(frame, (bytes, bytearray)) and len(frame) >= 26 else None
-        if parsed is None:
-            self.correct = 0
-            self.miss = min(65535, self.miss + 1)
+        if not ok:
             if self.miss == 1 or self.miss % 20 == 0:
-                self.append("no frame (%d bytes, miss %d)" % (rxlen, self.miss))
+                self.append("no frame (%d bytes, miss %d)" % (self.rxlen, self.miss))
             return False
-        self._apply_feedback(parsed)
-        return True
-
-    def _read_frame(self, budget):
-        ser = self._ser
-        buf = b""
-        end = time.monotonic() + budget
-        while time.monotonic() < end and len(buf) < 64:
-            remain = end - time.monotonic()
-            if remain <= 0:
-                break
-            ready, _, _ = select.select([ser], [], [], remain)
-            if not ready:
-                break
-            chunk = ser.read(64 - len(buf))
-            if not chunk:
-                continue
-            buf += chunk
-            idx = buf.find(b"\xFC\xEE")
-            if idx >= 0 and len(buf) >= idx + 26:
-                return buf[idx : idx + 26], len(buf)
-        return buf, len(buf)
-
-    def _apply_feedback(self, parsed):
-        was = self.miss
-        self.correct = 1
-        self.miss = 0
-        self.rx_ok += 1
-        self.fb_id = parsed["motor_id"]
-        self.fb_mode = parsed["mode"]
-        self.fb_timeout = parsed["timeout"]
-        self.temp = parsed["temp"]
-        self.sensor = parsed["sensor"]
-        self.vol = parsed["vol"]
-        self.merror = parsed["merror"]
-        self.mwarn = parsed["mwarn"]
-        self.ex_pos = parsed["ex_pos"]
-        self.meas_tor = parsed["output_tor"]
-        self.meas_spd = parsed["output_spd"]
-        self.meas_pos = parsed["output_pos"]
         if not self._pos_touched and not self.armed and not self.wave_on:
             self.cmd_pos = clamp_pos(self.meas_pos)
         self._note_faults()
-        if was >= 5:
+        if was_miss >= 5:
             self.append("feedback restored")
+        return True
 
     def _clear_tripped_timeout(self):
         """A locked frame with the timeout bit at 0 clears a tripped flag.
@@ -942,7 +899,11 @@ class MotorBench:
             for _ in range(3):
                 # The reply still shows the old bit until the next frame.
                 time.sleep(0.03)
-                self._exchange(probe=False)
+                was = self.miss
+                sent = self.tx_count
+                ok = self.send()
+                if self.tx_count != sent:
+                    self._after_send(was, ok)
                 if self.fresh() and not self.fb_timeout:
                     break
         finally:
@@ -1082,29 +1043,32 @@ class MotorBench:
             pass
 
     def shutdown(self):
-        if self._closed:
-            return
-        self._save_settings()
+        """Stop the port. Returns even when a probe is still inside the driver."""
         self._closed = True
-        self.armed = False
-        self._once = ""
-        ser = self._ser
-        if ser is not None:
-            try:
-                if ser.is_open:
-                    packet = build_packet(
-                        self.motor_id,
-                        0,
-                        1,
-                        0.0,
-                        0.0,
-                        self.cmd_pos,
-                        0.0,
-                        0.0,
-                    )
-                    ser.write(packet)
-                    ser.flush()
-            except Exception:
-                pass
-        self._close_ser()
-        self.linked = False
+        self._save_settings()
+        if not self._busy.acquire(timeout=0.2):
+            note("shutdown")
+            return
+        try:
+            if self._shut:
+                return
+            self._shut = True
+            self.armed = False
+            self._once = ""
+            self.cmd_spd = 0.0
+            self.cmd_tor = 0.0
+            self.kp = 0.0
+            self.kd = 0.0
+            self.timeout_flag = 1
+            self.quiet_until = 0.0
+            self._reset_integrator()
+            if self.bus.is_open:
+                try:
+                    self.send(reply=False)
+                except Exception:
+                    pass
+            self._close_ser()
+            self.linked = False
+            note("shutdown")
+        finally:
+            self._busy.release()

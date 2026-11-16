@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.playwright-mcp/
+motor_settings.json
+*.json.tmp
+.DS_Store
